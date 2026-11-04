@@ -111,13 +111,41 @@ function openMaterialModal(material = null) {
   form.elements.content.required = false;
   const existing = material ? (state.data.attachments || []).filter(a => a.material_id === material.id) : [];
   form.querySelector('.form-actions').insertAdjacentHTML('beforebegin', `<div class="field" style="margin-top:16px"><label for="study-files">첨부파일 여러 개 선택</label><input id="study-files" name="files" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.hwp,.hwpx" /><span class="hint">PDF, 이미지, 문서 등 · 파일당 최대 20MB</span></div>${existing.length ? `<div class="field"><label>올린 파일</label><div class="attachment-list">${existing.map(a => `<div class="attachment-row" data-attachment-row="${a.id}"><span>📎 ${esc(a.display_name)} <small>${fileSize(a.size_bytes)}</small></span><span><button type="button" class="btn small ghost" data-open-attachment="${a.id}">열기</button><button type="button" class="btn small ghost danger" data-delete-attachment="${a.id}">삭제</button></span></div>`).join('')}</div></div>` : ''}<div class="hint" id="upload-progress" role="status" aria-live="polite"></div>`);
+  form.querySelector('.form-actions').insertAdjacentHTML('beforebegin', `<section class="ai-panel"><h3>✦ AI 학습 도우미</h3><p class="hint">본문 또는 저장된 파일로 요약·퀴즈를 만들고 질문할 수 있어요.</p><div class="field"><label for="ai-file">AI가 참고할 파일 (선택)</label><select id="ai-file"><option value="">본문만 사용</option>${existing.filter(a => a.size_bytes <= 8 * 1024 * 1024 && /^(application\/pdf|image\/(png|jpeg|webp|gif)|text\/plain)$/.test(a.mime_type)).map(a => `<option value="${a.id}">${esc(a.display_name)}</option>`).join('')}</select><span class="hint">PDF·이미지·TXT, 8MB 이하 · 새 파일은 저장 후 선택할 수 있어요.</span></div><div class="field"><label for="ai-question">자료에 질문하기</label><textarea id="ai-question" maxlength="500" placeholder="예: 이 자료에서 시험에 나올 핵심 개념은 무엇이야?"></textarea></div><button type="button" class="btn small" id="ai-ask">질문 보내기</button><div id="ai-answer" class="ai-answer" role="status" aria-live="polite"></div></section>`);
   document.querySelectorAll('[data-open-attachment]').forEach(el => el.onclick = () => openAttachment(existing.find(a => a.id === el.dataset.openAttachment), true));
   document.querySelectorAll('[data-delete-attachment]').forEach(el => el.onclick = async () => {
     if (!confirm('이 첨부파일을 삭제할까요?')) return;
     try { await api('attachment.delete', { id: el.dataset.deleteAttachment }); state.data.attachments = state.data.attachments.filter(a => a.id !== el.dataset.deleteAttachment); document.querySelector(`[data-attachment-row="${el.dataset.deleteAttachment}"]`)?.remove(); toast('파일을 삭제했어요.'); }
     catch (error) { toast(error.message); }
   });
-  document.querySelector('#ai-generate').onclick = async () => { const form = document.querySelector('#material-form'); const content = form.elements.content.value.trim(); if (content.length < 30) return toast('공부 내용을 30자 이상 적어 주세요.'); const button = document.querySelector('#ai-generate'); button.disabled = true; button.textContent = 'AI가 정리하는 중…'; try { if (!await ensureSession()) throw Error('다시 로그인해 주세요.'); const result = await fetch('/api/ai', { method:'POST', headers:{ 'content-type':'application/json', authorization:`Bearer ${state.session.access_token}` }, body:JSON.stringify({ title:form.elements.title.value, content }) }); const data = await result.json(); if (!result.ok) throw Error(data.error || 'AI 생성에 실패했습니다.'); form.elements.summary.value = data.summary; form.elements.quiz_text.value = data.quiz_items.map(q => `${q.question} | ${q.answer}`).join('\n'); toast('AI 초안을 만들었어요. 내용을 확인해 주세요.'); } catch(error) { toast(error.message); } finally { button.disabled = false; button.textContent = '✦ AI로 요약·문제 만들기'; } };
+  async function askAI(mode) {
+    const content = form.elements.content.value.trim();
+    const attachmentId = document.querySelector('#ai-file').value;
+    const question = document.querySelector('#ai-question').value.trim();
+    if (!attachmentId && content.length < 30) return toast('본문을 30자 이상 쓰거나 저장된 파일을 선택해 주세요.');
+    if (mode === 'ask' && question.length < 2) return toast('질문을 입력해 주세요.');
+    const button = document.querySelector(mode === 'ask' ? '#ai-ask' : '#ai-generate');
+    button.disabled = true;
+    const label = button.textContent;
+    button.textContent = 'AI가 살펴보는 중…';
+    try {
+      if (!await ensureSession()) throw Error('다시 로그인해 주세요.');
+      const response = await fetch('/api/ai', { method: 'POST', headers: { 'content-type': 'application/json',
+        authorization: `Bearer ${state.session.access_token}` }, body: JSON.stringify({
+          mode, title: form.elements.title.value, content, question, attachment_id: attachmentId || undefined,
+        }) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw Error(data.error || 'AI 요청에 실패했습니다.');
+      if (mode === 'generate') {
+        form.elements.summary.value = data.summary;
+        form.elements.quiz_text.value = data.quiz_items.map(q => `${q.question} | ${q.answer}`).join('\n');
+        toast('AI 초안을 만들었어요. 내용을 확인해 주세요.');
+      } else document.querySelector('#ai-answer').textContent = data.answer;
+    } catch (error) { toast(error.message); }
+    finally { button.disabled = false; button.textContent = label; }
+  }
+  document.querySelector('#ai-generate').onclick = () => askAI('generate');
+  document.querySelector('#ai-ask').onclick = () => askAI('ask');
   document.querySelector('#material-form').onsubmit = async e => {
     e.preventDefault();
     const f = new FormData(e.currentTarget);
@@ -169,4 +197,3 @@ function guest() {
 }
 
 if (guestToken) loadGuest(); else if (params.has('admin')) { if (state.session) loadDashboard(); else login(); } else landing();
-
