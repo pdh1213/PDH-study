@@ -16,7 +16,7 @@
 - Supabase: Auth, 자료 데이터베이스, 공유 링크 검사 Edge Function (`study-api.ts`)
 - 공개 테이블은 RLS를 켜고 브라우저 역할의 직접 접근을 차단했습니다. 자료 접근은 Edge Function에서 관리자 인증 또는 공유 토큰을 검사합니다.
 - 첨부파일은 비공개 Supabase Storage 버킷에 저장됩니다. PDF, 이미지, 문서 파일을 한 자료에 여러 개 올릴 수 있으며 파일당 20MB까지 받습니다. 파일을 열 때 공유 링크의 범위를 다시 검사합니다.
-- AI는 관리자 로그인 후 Vercel AI Gateway의 `openai/gpt-4.1-mini`를 사용합니다. Gateway 인증 또는 크레딧이 없거나 사용이 제한되면 AI 요청은 실패할 수 있습니다.
+- AI는 관리자 로그인 후 Gemini API의 `gemini-3.5-flash-lite`를 사용합니다. Vercel 프로젝트의 Production 환경 변수 `GEMINI_API_KEY`에 Google AI Studio에서 발급한 키를 등록해야 합니다. 무료 사용량 한도가 적용됩니다.
 
 ## 소스
 
