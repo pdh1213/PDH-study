@@ -46,26 +46,93 @@ async function uploadAttachment(materialId, file) {
   if (!response.ok) throw Error(result.error || `${file.name} 업로드 실패`);
   return result.attachment;
 }
-async function openAttachment(attachment, asOwner, preview = true) {
-  const canPreview = /^(image\/|application\/pdf|text\/plain)/.test(attachment.mime_type);
-  const popup = preview && canPreview ? window.open('', '_blank') : null;
-  if (popup) popup.opener = null;
+const PREVIEW_MIME = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'text/plain']);
+async function openAttachment(attachment, asOwner) {
+  if (!PREVIEW_MIME.has(attachment.mime_type)) return toast('이 형식은 웹 미리보기를 지원하지 않습니다. 관리자에게 PDF나 이미지 파일을 요청해 주세요.');
+  const viewer = document.createElement('div');
+  viewer.className = 'file-viewer-backdrop';
+  viewer.innerHTML = `<section class="file-viewer" role="dialog" aria-modal="true" aria-label="${esc(attachment.display_name)}"><header class="file-viewer-head"><h2>📎 ${esc(attachment.display_name)}</h2><button type="button" class="btn small" id="close-file-viewer">닫기</button></header><div class="file-viewer-body" id="file-viewer-body" aria-live="polite">파일을 불러오는 중…</div></section>`;
+  document.body.append(viewer);
+  let pdfDocument = null;
+  const close = () => { pdfDocument?.destroy(); viewer.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = event => { if (event.key === 'Escape') close(); };
+  document.addEventListener('keydown', onKey);
+  viewer.querySelector('#close-file-viewer').onclick = close;
+  viewer.onclick = event => { if (event.target === viewer) close(); };
+  viewer.oncontextmenu = event => event.preventDefault();
+  const body = viewer.querySelector('#file-viewer-body');
   try {
     if (asOwner && !await ensureSession()) throw Error('다시 로그인해 주세요.');
-    const response = await fetch(API_URL, { method: 'POST', headers: { apikey: PUBLIC_KEY, 'content-type': 'application/json',
-      ...(asOwner ? { authorization: `Bearer ${state.session.access_token}` } : {}) },
-      body: JSON.stringify({ action: 'attachment.read', id: attachment.id, ...(asOwner ? {} : { token: guestToken }) }) });
+    const response = await fetch(API_URL, { method: 'POST', cache: 'no-store',
+      headers: { apikey: PUBLIC_KEY, 'content-type': 'application/json',
+        ...(asOwner ? { authorization: `Bearer ${state.session.access_token}` } : {}) },
+      body: JSON.stringify({ action: 'attachment.preview', id: attachment.id, ...(asOwner ? {} : { token: guestToken }) }) });
     if (!response.ok) { const result = await response.json().catch(() => ({})); throw Error(result.error || '파일을 열 수 없습니다.'); }
-    const url = URL.createObjectURL(await response.blob());
-    if (popup) popup.location.href = url;
-    else { const link = document.createElement('a'); link.href = url; link.download = attachment.display_name; document.body.append(link); link.click(); link.remove(); }
-    setTimeout(() => URL.revokeObjectURL(url), 600000);
-  } catch (error) { popup?.close(); toast(error.message); }
+    const mime = response.headers.get('content-type')?.split(';')[0];
+    if (mime !== attachment.mime_type || !PREVIEW_MIME.has(mime)) throw Error('미리보기를 지원하지 않는 파일입니다.');
+    const bytes = await response.arrayBuffer();
+    if (!viewer.isConnected) return;
+    body.replaceChildren();
+    if (mime === 'application/pdf') {
+      const pdfjs = await import('/vendor/pdfjs/pdf.min.mjs');
+      pdfjs.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.min.mjs';
+      pdfDocument = await pdfjs.getDocument({ data: new Uint8Array(bytes) }).promise;
+      if (!viewer.isConnected) { pdfDocument.destroy(); return; }
+      const controls = document.createElement('div');
+      controls.className = 'file-page-controls';
+      controls.innerHTML = '<button type="button" class="btn small" id="prev-file-page">이전</button><span id="file-page-count"></span><button type="button" class="btn small" id="next-file-page">다음</button>';
+      const canvas = document.createElement('canvas');
+      canvas.className = 'file-canvas';
+      body.append(controls, canvas);
+      let currentPage = 1;
+      async function renderPage(pageNumber) {
+        const prev = controls.querySelector('#prev-file-page'), next = controls.querySelector('#next-file-page');
+        prev.disabled = next.disabled = true;
+        const page = await pdfDocument.getPage(pageNumber);
+        if (!viewer.isConnected) return;
+        const original = page.getViewport({ scale: 1 });
+        const scale = Math.min(1.6, Math.max(0.3, (body.clientWidth - 24) / original.width));
+        const viewport = page.getViewport({ scale });
+        const ratio = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.floor(viewport.width * ratio);
+        canvas.height = Math.floor(viewport.height * ratio);
+        canvas.style.width = `${viewport.width}px`;
+        canvas.style.height = `${viewport.height}px`;
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport,
+          transform: [ratio, 0, 0, ratio, 0, 0] }).promise;
+        currentPage = pageNumber;
+        controls.querySelector('#file-page-count').textContent = `${currentPage} / ${pdfDocument.numPages}`;
+        prev.disabled = currentPage === 1;
+        next.disabled = currentPage === pdfDocument.numPages;
+      }
+      controls.querySelector('#prev-file-page').onclick = () => renderPage(currentPage - 1).catch(error => toast(error.message));
+      controls.querySelector('#next-file-page').onclick = () => renderPage(currentPage + 1).catch(error => toast(error.message));
+      await renderPage(1);
+    } else if (mime.startsWith('image/')) {
+      const image = await createImageBitmap(new Blob([bytes], { type: mime }));
+      if (!viewer.isConnected) { image.close(); return; }
+      const canvas = document.createElement('canvas');
+      canvas.className = 'file-canvas';
+      const scale = Math.min(1, 1800 / Math.max(image.width, image.height));
+      canvas.width = Math.max(1, Math.floor(image.width * scale));
+      canvas.height = Math.max(1, Math.floor(image.height * scale));
+      canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+      image.close();
+      body.append(canvas);
+    } else {
+      const pre = document.createElement('pre');
+      pre.className = 'file-text';
+      pre.textContent = new TextDecoder().decode(bytes).slice(0, 150000);
+      body.append(pre);
+    }
+  } catch (error) {
+    if (viewer.isConnected) body.textContent = error.message || '미리보기를 열 수 없습니다.';
+  }
 }
 const fileSize = size => size >= 1048576 ? `${(size / 1048576).toFixed(1)}MB` : `${Math.max(1, Math.round(size / 1024))}KB`;
 function landing() {
   app.innerHTML = `${header('<span class="muted">나만의 자료, 필요한 만큼만 공유</span><a class="btn small" href="/?admin=1">관리자 로그인</a>')}
-    <main class="shell"><section class="hero"><div><div class="eyebrow"><span class="dot"></span> MY STUDY SPACE</div><h1>공부할 자료를<br>한 곳에,<br>친구들과 함께.</h1><p>수행평가부터 지필고사까지. 내 자료를 과목별로 정리하고, 공유할 범위만 골라 친구에게 링크를 보내세요.</p><div class="hero-actions"><a href="/?admin=1" class="btn primary">내 공부 공간 열기 →</a></div></div><div class="hero-visual" aria-hidden="true"><div class="paper"><div class="paper-top"><span>STUDY NOTE / 01</span><span>✦</span></div><h3>2학기 지필고사 정리</h3><span class="badge">한국사</span><div class="line"></div><div class="line"></div><div class="line short"></div></div><div class="paper secondary"><div class="paper-top"><span>QUICK REVIEW</span><span>↗</span></div><h3>오늘의 암기 문제</h3><div class="line"></div><div class="line short"></div></div></div></section><section class="section"><div class="section-head"><div><div class="eyebrow">HOW IT WORKS</div><h2>정리하고, 공유하고, 기억하기</h2><p>복잡한 설정 없이 공부에 필요한 흐름만 담았어요.</p></div></div><div class="feature-grid"><div class="feature"><div class="feature-icon">▤</div><h3>자료를 차곡차곡</h3><p>과목과 시험 종류별로 노트와 참고 링크를 정리하세요.</p></div><div class="feature"><div class="feature-icon">↗</div><h3>필요한 범위만 공유</h3><p>친구마다 볼 자료를 골라 링크를 만들고 언제든 끌 수 있어요.</p></div><div class="feature"><div class="feature-icon">✦</div><h3>퀴즈로 다시 보기</h3><p>AI가 만든 암기 문제를 확인하고 친구와 함께 풀어보세요.</p></div></div></section></main><footer class="footer"><div class="shell">© pdh study · 오늘의 공부가 내일의 자신감으로</div></footer>`;
+    <main class="shell"><section class="hero"><div><div class="eyebrow"><span class="dot"></span> MY STUDY SPACE</div><h1>공부할 자료를<br>한 곳에,<br>친구들과 함께.</h1><p>수행평가부터 지필고사까지. 내 자료를 과목별로 정리하고, 공유할 범위만 골라 친구에게 링크를 보내세요.</p><div class="hero-actions"><a href="/?admin=1" class="btn primary">내 공부 공간 열기 →</a></div></div><div class="hero-visual" aria-hidden="true"><div class="paper"><div class="paper-top"><span>STUDY NOTE / 01</span><span>✦</span></div><h3>2학기 지필고사 정리</h3><span class="badge">한국사</span><div class="line"></div><div class="line"></div><div class="line short"></div></div><div class="paper secondary"><div class="paper-top"><span>QUICK REVIEW</span><span>↗</span></div><h3>오늘의 암기 문제</h3><div class="line"></div><div class="line short"></div></div></div></section><section class="section"><div class="section-head"><div><div class="eyebrow">HOW IT WORKS</div><h2>정리하고, 공유하고, 기억하기</h2><p>복잡한 설정 없이 공부에 필요한 흐름만 담았어요.</p></div></div><div class="feature-grid"><div class="feature"><div class="feature-icon">▤</div><h3>자료를 차곡차곡</h3><p>과목과 시험 종류별로 노트와 참고 링크를 정리하세요.</p></div><div class="feature"><div class="feature-icon">↗</div><h3>필요한 범위만 공유</h3><p>친구마다 볼 자료를 골라 링크를 만들고 언제든 끌 수 있어요.</p></div><div class="feature"><div class="feature-icon">✦</div><h3>퀴즈로 다시 보기</h3><p>직접 만든 암기 문제를 확인하고 친구와 함께 풀어보세요.</p></div></div></section></main><footer class="footer"><div class="shell">© pdh study · 오늘의 공부가 내일의 자신감으로</div></footer>`;
 }
 function login() {
   app.innerHTML = `${header('<a class="btn small ghost" href="/">← 홈으로</a>')}<main class="auth-layout"><div class="auth-box"><div class="eyebrow"><span class="dot"></span> PRIVATE DESK</div><h1>${state.authMode === 'login' ? '관리자 로그인' : '관리자 첫 설정'}</h1><p>자료 작성과 공유 설정은 관리자만 할 수 있어요. 친구는 받은 링크에서 로그인 없이 공부합니다.</p><form id="auth-form"><div class="field"><label>이메일</label><input name="email" type="email" value="${OWNER_EMAIL}" readonly /></div>${state.authMode === 'setup' ? '<div class="field"><label>1회용 설정 코드</label><input name="code" autocomplete="off" required placeholder="전달받은 설정 코드를 입력하세요" /></div>' : ''}<div class="field"><label>비밀번호</label><input name="password" type="password" minlength="${state.authMode === 'setup' ? 10 : 8}" required placeholder="비밀번호를 입력하세요" /></div><button class="btn primary" style="width:100%;margin-top:5px">${state.authMode === 'login' ? '로그인' : '관리자 계정 만들기'}</button></form><button class="btn ghost" style="width:100%;margin-top:12px" id="switch-auth">${state.authMode === 'login' ? '처음이라면 관리자 설정' : '이미 설정했다면 로그인'}</button><div class="auth-note">설정 코드는 처음 한 번만 사용할 수 있어요. 친구에게는 공유 링크만 보내 주세요.</div></div></main>`;
@@ -106,46 +173,17 @@ function openRoomModal() {
 }
 function parseQuiz(text) { return text.split('\n').map(line => line.split('|')).filter(parts => parts.length >= 2 && parts[0].trim() && parts[1].trim()).map(parts => ({ question: parts[0].trim().slice(0,300), answer: parts.slice(1).join('|').trim().slice(0,500) })).slice(0,30); }
 function openMaterialModal(material = null) {
-  modal(`<h2>${material ? '자료 수정' : '새 자료 추가'}</h2><p class="sub">내용을 적고, 필요하면 AI로 암기 문제를 만들어 보세요.</p><form id="material-form"><div class="form-grid"><div class="field"><label>자료 제목</label><input name="title" required maxlength="160" value="${esc(material?.title)}" placeholder="예: 조선 후기 핵심 개념" /></div><div class="field"><label>과목</label><input name="subject" required maxlength="60" value="${esc(material?.subject)}" placeholder="예: 한국사" /></div><div class="field"><label>시험 종류</label><select name="exam_type">${['수행평가','지필고사','기타'].map(v => `<option ${material?.exam_type === v ? 'selected' : ''}>${v}</option>`).join('')}</select></div><div class="field"><label>참고 링크 (선택)</label><input name="source_url" type="url" value="${esc(material?.source_url)}" placeholder="https://" /></div><div class="field full"><label>핵심 요약</label><textarea name="summary" maxlength="300" style="min-height:78px" placeholder="핵심만 짧게 적어 주세요">${esc(material?.summary)}</textarea></div><div class="field full"><label>공부 내용</label><textarea name="content" maxlength="50000" required placeholder="수업 노트, 외울 내용, 정리한 개념을 적어 주세요">${esc(material?.content)}</textarea></div><div class="field full"><label>암기 문제 <span class="hint">(한 줄에 질문 | 정답)</span></label><textarea name="quiz_text" placeholder="임진왜란이 시작된 해는? | 1592년\n세종대왕이 창제한 문자는? | 훈민정음">${esc((material?.quiz_items || []).map(q => `${q.question} | ${q.answer}`).join('\n'))}</textarea><button class="btn small" type="button" id="ai-generate" style="align-self:flex-start">✦ AI로 요약·문제 만들기</button><span class="hint">AI 결과를 확인하고 수정한 뒤 저장해 주세요.</span></div></div><div class="form-actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary">${material ? '수정 저장' : '자료 저장'}</button></div></form>`);
+  modal(`<h2>${material ? '자료 수정' : '새 자료 추가'}</h2><p class="sub">내용을 적고 파일을 첨부한 뒤, 필요한 범위만 친구에게 공유하세요.</p><form id="material-form"><div class="form-grid"><div class="field"><label>자료 제목</label><input name="title" required maxlength="160" value="${esc(material?.title)}" placeholder="예: 조선 후기 핵심 개념" /></div><div class="field"><label>과목</label><input name="subject" required maxlength="60" value="${esc(material?.subject)}" placeholder="예: 한국사" /></div><div class="field"><label>시험 종류</label><select name="exam_type">${['수행평가','지필고사','기타'].map(v => `<option ${material?.exam_type === v ? 'selected' : ''}>${v}</option>`).join('')}</select></div><div class="field"><label>참고 링크 (선택)</label><input name="source_url" type="url" value="${esc(material?.source_url)}" placeholder="https://" /></div><div class="field full"><label>핵심 요약</label><textarea name="summary" maxlength="300" style="min-height:78px" placeholder="핵심만 짧게 적어 주세요">${esc(material?.summary)}</textarea></div><div class="field full"><label>공부 내용</label><textarea name="content" maxlength="50000" required placeholder="수업 노트, 외울 내용, 정리한 개념을 적어 주세요">${esc(material?.content)}</textarea></div><div class="field full"><label>암기 문제 <span class="hint">(한 줄에 질문 | 정답)</span></label><textarea name="quiz_text" placeholder="임진왜란이 시작된 해는? | 1592년\n세종대왕이 창제한 문자는? | 훈민정음">${esc((material?.quiz_items || []).map(q => `${q.question} | ${q.answer}`).join('\n'))}</textarea></div></div><div class="form-actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary">${material ? '수정 저장' : '자료 저장'}</button></div></form>`);
   const form = document.querySelector('#material-form');
   form.elements.content.required = false;
   const existing = material ? (state.data.attachments || []).filter(a => a.material_id === material.id) : [];
-  form.querySelector('.form-actions').insertAdjacentHTML('beforebegin', `<div class="field" style="margin-top:16px"><label for="study-files">첨부파일 여러 개 선택</label><input id="study-files" name="files" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.hwp,.hwpx" /><span class="hint">PDF, 이미지, 문서 등 · 파일당 최대 20MB</span></div>${existing.length ? `<div class="field"><label>올린 파일</label><div class="attachment-list">${existing.map(a => `<div class="attachment-row" data-attachment-row="${a.id}"><span>📎 ${esc(a.display_name)} <small>${fileSize(a.size_bytes)}</small></span><span><button type="button" class="btn small ghost" data-open-attachment="${a.id}">열기</button><button type="button" class="btn small ghost danger" data-delete-attachment="${a.id}">삭제</button></span></div>`).join('')}</div></div>` : ''}<div class="hint" id="upload-progress" role="status" aria-live="polite"></div>`);
-  form.querySelector('.form-actions').insertAdjacentHTML('beforebegin', `<section class="ai-panel"><h3>✦ AI 학습 도우미</h3><p class="hint">본문 또는 저장된 파일로 요약·퀴즈를 만들고 질문할 수 있어요.</p><div class="field"><label for="ai-file">AI가 참고할 파일 (선택)</label><select id="ai-file"><option value="">본문만 사용</option>${existing.filter(a => a.size_bytes <= 8 * 1024 * 1024 && /^(application\/pdf|image\/(png|jpeg|webp|gif)|text\/plain)$/.test(a.mime_type)).map(a => `<option value="${a.id}">${esc(a.display_name)}</option>`).join('')}</select><span class="hint">PDF·이미지·TXT, 8MB 이하 · 새 파일은 저장 후 선택할 수 있어요.</span></div><div class="field"><label for="ai-question">자료에 질문하기</label><textarea id="ai-question" maxlength="500" placeholder="예: 이 자료에서 시험에 나올 핵심 개념은 무엇이야?"></textarea></div><button type="button" class="btn small" id="ai-ask">질문 보내기</button><div id="ai-answer" class="ai-answer" role="status" aria-live="polite"></div></section>`);
+  form.querySelector('.form-actions').insertAdjacentHTML('beforebegin', `<div class="field" style="margin-top:16px"><label for="study-files">첨부파일 여러 개 선택</label><input id="study-files" name="files" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.hwp,.hwpx" /><span class="hint">파일당 최대 20MB · 친구 화면 미리보기는 PDF, 이미지, TXT만 가능</span></div>${existing.length ? `<div class="field"><label>올린 파일</label><div class="attachment-list">${existing.map(a => `<div class="attachment-row" data-attachment-row="${a.id}"><span>📎 ${esc(a.display_name)} <small>${fileSize(a.size_bytes)}</small></span><span><button type="button" class="btn small ghost" data-open-attachment="${a.id}">열기</button><button type="button" class="btn small ghost danger" data-delete-attachment="${a.id}">삭제</button></span></div>`).join('')}</div></div>` : ''}<div class="hint" id="upload-progress" role="status" aria-live="polite"></div>`);
   document.querySelectorAll('[data-open-attachment]').forEach(el => el.onclick = () => openAttachment(existing.find(a => a.id === el.dataset.openAttachment), true));
   document.querySelectorAll('[data-delete-attachment]').forEach(el => el.onclick = async () => {
     if (!confirm('이 첨부파일을 삭제할까요?')) return;
     try { await api('attachment.delete', { id: el.dataset.deleteAttachment }); state.data.attachments = state.data.attachments.filter(a => a.id !== el.dataset.deleteAttachment); document.querySelector(`[data-attachment-row="${el.dataset.deleteAttachment}"]`)?.remove(); toast('파일을 삭제했어요.'); }
     catch (error) { toast(error.message); }
   });
-  async function askAI(mode) {
-    const content = form.elements.content.value.trim();
-    const attachmentId = document.querySelector('#ai-file').value;
-    const question = document.querySelector('#ai-question').value.trim();
-    if (!attachmentId && content.length < 30) return toast('본문을 30자 이상 쓰거나 저장된 파일을 선택해 주세요.');
-    if (mode === 'ask' && question.length < 2) return toast('질문을 입력해 주세요.');
-    const button = document.querySelector(mode === 'ask' ? '#ai-ask' : '#ai-generate');
-    button.disabled = true;
-    const label = button.textContent;
-    button.textContent = 'AI가 살펴보는 중…';
-    try {
-      if (!await ensureSession()) throw Error('다시 로그인해 주세요.');
-      const response = await fetch('/api/ai', { method: 'POST', headers: { 'content-type': 'application/json',
-        authorization: `Bearer ${state.session.access_token}` }, body: JSON.stringify({
-          mode, title: form.elements.title.value, content, question, attachment_id: attachmentId || undefined,
-        }) });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw Error(data.error || 'AI 요청에 실패했습니다.');
-      if (mode === 'generate') {
-        form.elements.summary.value = data.summary;
-        form.elements.quiz_text.value = data.quiz_items.map(q => `${q.question} | ${q.answer}`).join('\n');
-        toast('AI 초안을 만들었어요. 내용을 확인해 주세요.');
-      } else document.querySelector('#ai-answer').textContent = data.answer;
-    } catch (error) { toast(error.message); }
-    finally { button.disabled = false; button.textContent = label; }
-  }
-  document.querySelector('#ai-generate').onclick = () => askAI('generate');
-  document.querySelector('#ai-ask').onclick = () => askAI('ask');
   document.querySelector('#material-form').onsubmit = async e => {
     e.preventDefault();
     const f = new FormData(e.currentTarget);
@@ -185,7 +223,7 @@ function guest() {
   app.innerHTML = `${header('<span class="muted">친구와 함께 공부하기</span>')}<div class="reader-head"><div class="shell"><div class="eyebrow"><span class="dot"></span> SHARED STUDY SPACE</div><h1>${esc(room.title)}</h1><p>${esc(room.description || '함께 공부할 자료를 모아두었어요.')}</p><div class="stats"><span class="stat">자료 ${materials.length}개</span><span class="stat">${can_practice ? '암기 퀴즈 가능' : '자료 보기'}</span></div></div></div><main class="shell reader">${materials.length ? `<div class="reader-grid"><nav class="reader-list" aria-label="공부 자료">${materials.map(m => `<button class="reader-link ${m.id === state.guestMaterialId ? 'active' : ''}" data-guest-material="${m.id}"><span class="badge">${esc(m.subject)}</span><div style="margin-top:9px;font-weight:700">${esc(m.title)}</div><small style="color:#94a195">${esc(m.exam_type)}</small></button>`).join('')}</nav><article class="article"><div class="meta"><span class="badge">${esc(material.subject)}</span><span class="badge">${esc(material.exam_type)}</span></div><h2>${esc(material.title)}</h2>${material.summary ? `<p style="font-weight:700;color:#355b43">${esc(material.summary)}</p>` : ''}<p>${esc(material.content)}</p>${material.source_url && /^https?:\/\//i.test(material.source_url) ? `<a class="source" href="${esc(material.source_url)}" target="_blank" rel="noopener noreferrer">참고 자료 열기 ↗</a>` : ''}${can_practice && material.quiz_items?.length ? `<section class="quiz"><div class="section-head"><div><div class="eyebrow">QUICK REVIEW</div><h3 style="margin:8px 0 0">암기 퀴즈</h3></div></div><div class="quiz-card"><div class="quiz-num">QUESTION ${state.quizIndex + 1} / ${material.quiz_items.length}</div><div class="quiz-question">${esc(material.quiz_items[state.quizIndex % material.quiz_items.length].question)}</div>${state.answerShown ? `<div class="quiz-answer">✓ ${esc(material.quiz_items[state.quizIndex % material.quiz_items.length].answer)}</div>` : ''}</div><div class="quiz-actions"><button class="btn primary" id="reveal-answer">${state.answerShown ? '정답 확인 완료' : '정답 보기'}</button><button class="btn" id="next-question">다음 문제 →</button></div></section>` : ''}</article></div>` : `<div class="empty"><div class="empty-icon">▤</div><h3>공유된 자료가 아직 없어요</h3><p>관리자가 자료를 추가하면 여기에서 볼 수 있어요.</p></div>`}</main>`;
   const attachments = (state.guest.attachments || []).filter(a => a.material_id === material?.id);
   if (attachments.length) {
-    const section = `<section class="attachments"><h3>첨부파일 <span class="hint">${attachments.length}개</span></h3><div class="attachment-list">${attachments.map(a => `<div class="attachment-row"><span>📎 ${esc(a.display_name)} <small>${fileSize(a.size_bytes)}</small></span><button class="btn small" data-guest-attachment="${a.id}">열기 / 저장</button></div>`).join('')}</div></section>`;
+    const section = `<section class="attachments"><h3>첨부파일 <span class="hint">${attachments.length}개</span></h3><div class="attachment-list">${attachments.map(a => `<div class="attachment-row"><span>📎 ${esc(a.display_name)} <small>${fileSize(a.size_bytes)}</small></span>${PREVIEW_MIME.has(a.mime_type) ? `<button class="btn small" data-guest-attachment="${a.id}">사이트에서 보기</button>` : `<span class="hint">웹 미리보기 미지원 · 관리자에게 PDF나 이미지를 요청해 주세요</span>`}</div>`).join('')}</div></section>`;
     const article = document.querySelector('.article');
     if (article.querySelector('.quiz')) article.querySelector('.quiz').insertAdjacentHTML('beforebegin', section);
     else article.insertAdjacentHTML('beforeend', section);

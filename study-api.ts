@@ -10,6 +10,7 @@ const storage = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession
 const extensions = new Set(['pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'txt', 'hwp', 'hwpx']);
 const safeMime: Record<string, string> = { pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
   gif: 'image/gif', webp: 'image/webp', txt: 'text/plain' };
+const previewMime = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'text/plain']);
 
 function headers(origin: string | null) {
   return {
@@ -143,10 +144,11 @@ Deno.serve(async req => {
       attachments = attachments.filter((a: any) => visibleIds.has(a.material_id));
       return reply({ room, materials, attachments, can_practice: share.can_practice }, 200, origin);
     }
-    if (action === 'attachment.read') {
+    if (action === 'attachment.preview') {
       if (!validUuid(data.id)) return bad('파일 ID가 올바르지 않습니다.', origin);
       const attachment = one(await db('study_attachments', 'GET', `?id=eq.${data.id}&select=*`));
       if (!attachment) return bad('파일을 찾을 수 없습니다.', origin, 404);
+      if (!previewMime.has(attachment.mime_type)) return bad('이 파일 형식은 웹 미리보기를 지원하지 않습니다.', origin, 415);
       if (data.token) {
         const share = await activeShare(data.token);
         if (!share || share.room_id !== attachment.room_id ||
@@ -156,9 +158,8 @@ Deno.serve(async req => {
       } else if (!await owner(req)) return bad('관리자 로그인이 필요합니다.', origin, 401);
       const { data: file, error } = await storage.download(attachment.storage_path);
       if (error || !file) return bad('파일을 열 수 없습니다.', origin, 500);
-      const inline = attachment.mime_type === 'application/pdf' || attachment.mime_type.startsWith('image/') || attachment.mime_type === 'text/plain';
       return new Response(file, { status: 200, headers: { ...headers(origin), 'content-type': attachment.mime_type,
-        'content-disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(attachment.display_name)}`,
+        'content-disposition': 'inline', 'cache-control': 'private, no-store', 'pragma': 'no-cache',
         'x-content-type-options': 'nosniff' } });
     }
 
@@ -236,4 +237,3 @@ Deno.serve(async req => {
     return bad('요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.', origin, 500);
   }
 });
-
